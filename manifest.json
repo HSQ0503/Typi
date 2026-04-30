@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "Typi",
+  "version": "0.2.0",
+  "description": "Human-like typing into Google Docs, planned by an LLM.",
+  "action": {
+    "default_popup": "popup.html"
+  },
+  "permissions": ["activeTab", "scripting", "storage"],
+  "host_permissions": [
+    "https://docs.google.com/*",
+    "https://api.openai.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://docs.google.com/document/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

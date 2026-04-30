@@ -180,6 +180,8 @@ async function executePlan(plan) {
   }
 }
 
+const ERROR_KEY = "typi:lastError";
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "STOP") {
     aborted = true;
@@ -187,8 +189,20 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return;
   }
   if (msg?.type !== "EXECUTE_PLAN") return;
+
+  chrome.storage.local.remove(ERROR_KEY);
+
   executePlan(msg.plan)
     .then(() => sendResponse({ ok: true }))
-    .catch((e) => sendResponse({ ok: e.name === "AbortedError", error: e.message, aborted: e.name === "AbortedError" }));
+    .catch((e) => {
+      const isAbort = e.name === "AbortedError";
+      if (!isAbort) {
+        console.error("[Typi] Executor error:", e);
+        chrome.storage.local.set({
+          [ERROR_KEY]: { message: e.message, stack: e.stack || "", ts: Date.now() }
+        });
+      }
+      sendResponse({ ok: isAbort, error: e.message, aborted: isAbort });
+    });
   return true;
 });

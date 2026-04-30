@@ -5,7 +5,9 @@ const stopEl = document.getElementById("stop");
 const planEl = document.getElementById("plan");
 const planHeadingEl = document.getElementById("planHeading");
 
-const STORAGE_KEY = "typi:lastPlan";
+const PLAN_KEY = "typi:lastPlan";
+const ERROR_KEY = "typi:lastError";
+const ERROR_TTL_MS = 5 * 60 * 1000;
 
 function el(tag, className, textContent) {
   const e = document.createElement(tag);
@@ -45,10 +47,24 @@ function renderPlan(plan) {
   }
 }
 
-chrome.storage.local.get(STORAGE_KEY).then((res) => {
-  const cached = res[STORAGE_KEY];
+function showError(message) {
+  statusEl.textContent = message;
+  statusEl.style.color = "#b00";
+}
+function showStatus(message) {
+  statusEl.textContent = message;
+  statusEl.style.color = "";
+}
+
+chrome.storage.local.get([PLAN_KEY, ERROR_KEY]).then((res) => {
+  const cached = res[PLAN_KEY];
   if (cached?.plan) renderPlan(cached.plan);
   if (cached?.text) textEl.value = cached.text;
+
+  const lastErr = res[ERROR_KEY];
+  if (lastErr && Date.now() - lastErr.ts < ERROR_TTL_MS) {
+    showError(`Last run errored: ${lastErr.message}`);
+  }
 });
 
 stopEl.addEventListener("click", async () => {
@@ -56,29 +72,30 @@ stopEl.addEventListener("click", async () => {
   if (!tab) return;
   try {
     await chrome.tabs.sendMessage(tab.id, { type: "STOP" });
-    statusEl.textContent = "Stopped.";
+    showStatus("Stopped.");
   } catch (e) {
-    statusEl.textContent = `Stop failed: ${e.message}`;
+    showError(`Stop failed: ${e.message}`);
   }
 });
 
 runEl.addEventListener("click", async () => {
   const text = textEl.value;
   if (!text.trim()) {
-    statusEl.textContent = "Paste some text first.";
+    showStatus("Paste some text first.");
     return;
   }
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.url?.startsWith("https://docs.google.com/document/")) {
-    statusEl.textContent = "Open a Google Doc tab first.";
+    showStatus("Open a Google Doc tab first.");
     return;
   }
 
   runEl.disabled = true;
-  statusEl.textContent = "Planning with gpt-4o-mini...";
+  showStatus("Planning with gpt-4o-mini...");
   planEl.innerHTML = "";
   planHeadingEl.style.display = "none";
+  chrome.storage.local.remove(ERROR_KEY);
 
   try {
     const planRes = await chrome.runtime.sendMessage({ type: "PLAN", text });
@@ -86,12 +103,12 @@ runEl.addEventListener("click", async () => {
 
     const plan = planRes.plan;
     renderPlan(plan);
-    chrome.storage.local.set({ [STORAGE_KEY]: { text, plan } });
-    statusEl.textContent = `Plan ready (${plan.actions.length} actions). Typing — you can close this.`;
+    chrome.storage.local.set({ [PLAN_KEY]: { text, plan } });
+    showStatus(`Plan ready (${plan.actions.length} actions). Typing — you can close this.`);
 
     chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_PLAN", plan }).catch(() => {});
   } catch (e) {
-    statusEl.textContent = `Error: ${e.message}`;
+    showError(`Error: ${e.message}`);
   } finally {
     runEl.disabled = false;
   }

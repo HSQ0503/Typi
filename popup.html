@@ -162,6 +162,17 @@
         font-size: 12px;
       }
 
+      input[type="range"] {
+        min-height: 0;
+        padding: 0;
+        width: 100%;
+        background: transparent;
+        border: none;
+        accent-color: var(--primary);
+      }
+      input[type="range"]:hover { border: none; }
+      input[type="range"]:focus-visible { box-shadow: none; outline: 2px solid var(--primary); outline-offset: 4px; }
+
       textarea {
         min-height: 152px;
         max-height: 260px;
@@ -359,6 +370,18 @@
           <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
           <p class="hint">Stored only for this Chrome profile. Set it once before planning.</p>
           <button id="saveKey" class="secondary" type="button">Set API key for this user</button>
+        </div>
+      </section>
+
+      <section class="card" aria-labelledby="speedHeading">
+        <div class="card-header">
+          <h2 id="speedHeading">Typing speed</h2>
+          <span class="microcopy" id="wpmReadout">150 WPM</span>
+        </div>
+        <div class="field-group">
+          <label for="wpm">Words per minute</label>
+          <input id="wpm" type="range" min="40" max="280" step="5" value="150" />
+          <p class="hint">Affects per-keystroke speed only. Pauses for thinking, sentence breaks, and revisions stay realistic regardless of speed.</p>
         </div>
       </section>
 

@@ -9,7 +9,7 @@ const MIN_PLANNING_CHUNK_WORDS = 350;
 const PROTECTED_BLANK_LINES_RE = /\n{2,}[ \t]*/g;
 const MIN_TYPO_RATE = 0.03;
 const MAX_TYPO_RATE = 0.06;
-const REVISION_WORD_THRESHOLD = 350;
+const REVISION_WORD_THRESHOLD = 250;
 
 const PLAN_SCHEMA = {
   type: "object",
@@ -336,8 +336,8 @@ function revisionCountRange(text) {
   if (isPromptLikeChunk(text)) return { words, min: 0, max: 0 };
   if (words < REVISION_WORD_THRESHOLD) return { words, min: 0, max: 0 };
 
-  const min = Math.max(1, Math.floor(words / 450));
-  const max = Math.max(min, Math.ceil(words / 350));
+  const min = Math.max(1, Math.floor(words / 350));
+  const max = Math.max(min, Math.ceil(words / 250));
   return { words, min, max };
 }
 
@@ -346,7 +346,7 @@ function revisionGuidance(text) {
   if (min === 0) {
     return `This input has approximately ${words} words. Include 0 revise actions for this chunk; use typo and pause actions only. This avoids fragile revisions in short or prompt-like chunks.`;
   }
-  return `This input has approximately ${words} words. Include between ${min} and ${max} revise actions, roughly one revision per 350-450 words. ` +
+  return `This input has approximately ${words} words. Include between ${min} and ${max} revise actions, roughly one revision per 250-350 words. ` +
     `Each revise action should represent a genuine idea/style change, but must follow the strict revision contract. ` +
     `Safe pattern: choose an exact final sentence/clause from the chunk, type a rough-draft version IN THAT SAME POSITION instead of the final wording, type 1-3 later final-text chunks, then revise that exact rough-draft target into the exact final wording for that same position. ` +
     `Do not replace a rough draft with a sentence that belongs later in the chunk; that reorders the final text. ` +
@@ -496,18 +496,43 @@ const ROUGH_DRAFT_SCHEMA = {
 
 function findRevisionCandidates(actions) {
   const candidates = [];
+  const seen = new Set();
 
+  function pushCandidate(actionIndex, offset, text) {
+    const key = `${actionIndex}:${offset}:${text.length}`;
+    if (seen.has(key)) return;
+    if (/recommended:|limit \d+ words|please expand|why did you choose/i.test(text)) return;
+    seen.add(key);
+    candidates.push({ actionIndex, offset, text });
+  }
+
+  // Pass 1: full sentences. Widened upper bound — literary prose has long sentences.
   for (let actionIndex = 0; actionIndex < actions.length; actionIndex++) {
     const action = actions[actionIndex];
-    if (action.type !== "write" || action.text.length < 80) continue;
+    if (action.type !== "write" || action.text.length < 60) continue;
     if (/^\s*$/.test(action.text)) continue;
 
-    const sentenceRe = /[^.!?\n]{50,180}[.!?]/g;
+    const sentenceRe = /[^.!?\n]{40,350}[.!?]/g;
     for (const match of action.text.matchAll(sentenceRe)) {
       const text = match[0];
-      if (text.length < 50 || text.length > 190) continue;
-      if (/recommended:|limit \d+ words|please expand|why did you choose/i.test(text)) continue;
-      candidates.push({ actionIndex, offset: match.index, text });
+      if (text.length < 40 || text.length > 360) continue;
+      pushCandidate(actionIndex, match.index, text);
+    }
+  }
+
+  if (candidates.length > 0) return candidates;
+
+  // Pass 2 (fallback): clauses delimited by , ; — when no sentence fit.
+  for (let actionIndex = 0; actionIndex < actions.length; actionIndex++) {
+    const action = actions[actionIndex];
+    if (action.type !== "write" || action.text.length < 50) continue;
+    if (/^\s*$/.test(action.text)) continue;
+
+    const clauseRe = /[^,;\n—]{35,220}[,;—]/g;
+    for (const match of action.text.matchAll(clauseRe)) {
+      const text = match[0];
+      if (text.length < 35 || text.length > 230) continue;
+      pushCandidate(actionIndex, match.index, text);
     }
   }
 
@@ -566,13 +591,27 @@ async function injectOneSafeRevision(plan, chunk, usedTargets = new Set()) {
   throw new Error("Could not inject a safe revision into this chunk");
 }
 
+const MAX_REVISION_INJECTION_ITERATIONS = 8;
+
 async function ensureRevisionRequirements(plan, chunk, attemptDebug) {
   const range = revisionCountRange(chunk);
   let revisedPlan = plan;
   const usedTargets = new Set();
+  let iterations = 0;
 
   while ((revisedPlan.actions || []).filter((action) => action.type === "revise").length < range.min) {
+    if (iterations++ >= MAX_REVISION_INJECTION_ITERATIONS) {
+      throw new Error(
+        `Could not reach minimum ${range.min} revision(s) after ${iterations} injection attempts; ` +
+        `chunk likely lacks suitable candidate sentences.`
+      );
+    }
+    const before = (revisedPlan.actions || []).filter((a) => a.type === "revise").length;
     revisedPlan = await injectOneSafeRevision(revisedPlan, chunk, usedTargets);
+    const after = (revisedPlan.actions || []).filter((a) => a.type === "revise").length;
+    if (after <= before) {
+      throw new Error("Revision injection returned the same plan; aborting to avoid spin.");
+    }
   }
 
   if (attemptDebug) {
@@ -733,16 +772,38 @@ async function generatePlan(text) {
       llmChunkIndex++;
     }
 
-    const combinedPlan = { actions };
+    let combinedPlan = { actions };
     const finalDiag = diagnosePlan(combinedPlan, text);
     debug.finalDiagnosis = finalDiag;
     if (!finalDiag.ok) {
       throw new Error(`Combined chunk plan mismatch: ${finalDiag.message}`);
     }
 
+    // Global revision enforcement: chunks split by paragraph breaks may each
+    // fall below REVISION_WORD_THRESHOLD individually, but the full input
+    // exceeds it. Inject revisions across the combined plan to satisfy the
+    // input-level minimum.
+    const globalRange = revisionCountRange(text);
+    const currentReviseCount = combinedPlan.actions.filter((a) => a.type === "revise").length;
+    debug.globalRevisionRange = globalRange;
+    debug.revisionCountBeforeGlobalPass = currentReviseCount;
+
+    if (currentReviseCount < globalRange.min) {
+      console.log(
+        `[Typi] Combined plan has ${currentReviseCount} revision(s); ` +
+        `global minimum is ${globalRange.min} for ${globalRange.words} words. Injecting...`
+      );
+      combinedPlan = await ensureRevisionRequirements(combinedPlan, text, null);
+      const postDiag = diagnosePlan(combinedPlan, text);
+      if (!postDiag.ok) {
+        throw new Error(`Plan mismatch after global revision injection: ${postDiag.message}`);
+      }
+    }
+
+    debug.revisionCountAfterGlobalPass = combinedPlan.actions.filter((a) => a.type === "revise").length;
     debug.ok = true;
     await savePlanningDebug(debug);
-    console.log(`[Typi] Full plan verified across ${llmUnits.length} LLM chunk(s), ${units.length} total unit(s), ${actions.length} actions.`);
+    console.log(`[Typi] Full plan verified across ${llmUnits.length} LLM chunk(s), ${units.length} total unit(s), ${combinedPlan.actions.length} actions, ${debug.revisionCountAfterGlobalPass} revision(s).`);
     return combinedPlan;
   } catch (e) {
     debug.finalError = e.message;

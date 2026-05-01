@@ -6,11 +6,15 @@ const runEl = document.getElementById("run");
 const stopEl = document.getElementById("stop");
 const planEl = document.getElementById("plan");
 const planHeadingEl = document.getElementById("planHeading");
+const wpmEl = document.getElementById("wpm");
+const wpmReadoutEl = document.getElementById("wpmReadout");
 
 const PLAN_KEY = "typi:lastPlan";
 const API_KEY_STORAGE_KEY = "typi:openaiApiKey";
 const PLANNING_DEBUG_KEY = "typi:lastPlanningDebug";
 const ERROR_KEY = "typi:lastError";
+const WPM_KEY = "typi:wpm";
+const DEFAULT_WPM = 150;
 const ERROR_TTL_MS = 5 * 60 * 1000;
 
 let lastSavedApiKey = "";
@@ -142,7 +146,17 @@ async function saveApiKey({ quiet = false } = {}) {
   return true;
 }
 
-chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERROR_KEY]).then((res) => {
+function clampWpm(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return DEFAULT_WPM;
+  return Math.max(40, Math.min(280, Math.round(n)));
+}
+
+function updateWpmReadout(wpm) {
+  if (wpmReadoutEl) wpmReadoutEl.textContent = `${wpm} WPM`;
+}
+
+chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERROR_KEY, WPM_KEY]).then((res) => {
   const cached = res[PLAN_KEY];
   if (cached?.plan) renderPlan(cached.plan);
   if (cached?.text) textEl.value = cached.text;
@@ -152,11 +166,27 @@ chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERR
     showStatus("API key is already saved for this Chrome user/profile.");
   }
 
+  const savedWpm = clampWpm(res[WPM_KEY] ?? DEFAULT_WPM);
+  if (wpmEl) wpmEl.value = String(savedWpm);
+  updateWpmReadout(savedWpm);
+
   const lastErr = res[ERROR_KEY];
   if (lastErr && Date.now() - lastErr.ts < ERROR_TTL_MS) {
     showError(`Last run errored: ${lastErr.message}`);
   }
 });
+
+if (wpmEl) {
+  wpmEl.addEventListener("input", () => {
+    const v = clampWpm(wpmEl.value);
+    updateWpmReadout(v);
+  });
+  wpmEl.addEventListener("change", () => {
+    const v = clampWpm(wpmEl.value);
+    updateWpmReadout(v);
+    chrome.storage.local.set({ [WPM_KEY]: v }).catch(() => {});
+  });
+}
 
 saveKeyEl.addEventListener("click", () => {
   saveApiKey().catch((e) => showError(`Save failed: ${e.message}`));
@@ -228,7 +258,8 @@ runEl.addEventListener("click", async () => {
     chrome.storage.local.set({ [PLAN_KEY]: { text, plan } });
     showStatus(`Plan ready (${plan.actions.length} actions). Typing — you can close this.`);
 
-    chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_PLAN", plan }).catch(() => {});
+    const wpm = clampWpm(wpmEl?.value ?? DEFAULT_WPM);
+    chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_PLAN", plan, wpm }).catch(() => {});
   } catch (e) {
     showError(`Error: ${e.message}`);
   } finally {

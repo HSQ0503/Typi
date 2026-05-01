@@ -7,6 +7,7 @@ const KEY = {
   Enter: 13,
   ArrowLeft: 37,
   ArrowRight: 39,
+  Delete: 46,
 };
 
 function getDocsTarget() {
@@ -19,6 +20,7 @@ function getDocsTarget() {
 
 function dispatchKey(doc, { key, code, keyCode, char, shiftKey }) {
   const target = doc.activeElement || doc.body;
+  if (typeof target?.focus === "function") target.focus();
   const common = {
     key, code: code || key, keyCode, which: keyCode,
     shiftKey: !!shiftKey, bubbles: true, cancelable: true
@@ -49,8 +51,25 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // 200 WPM ≈ 60ms/char. 100 WPM ≈ 120ms. 60 WPM ≈ 200ms.
 // Formula: MEAN_MS = 12000 / WPM  (assuming 5 chars per word)
 // JITTER_MS adds approx-normal variance around the mean.
-const MEAN_MS = 60;     // 200 WPM
-const JITTER_MS = 24;   // ~40% of mean feels natural
+const MEAN_MS = 20;     // 600 WPM (fast testing speed)
+const JITTER_MS = 8;    // ~40% of mean feels natural
+
+// Google Docs can occasionally drop synthetic editing keys if they are fired
+// immediately after typed characters. Keep typo corrections deliberately slower
+// than normal text so the misspelling is committed before Backspace events run.
+const TYPO_BEFORE_BACKSPACE_MIN_MS = 180;
+const TYPO_BEFORE_BACKSPACE_JITTER_MS = 100;
+const TYPO_BACKSPACE_MS = 70;
+const TYPO_AFTER_BACKSPACE_MIN_MS = 100;
+const TYPO_AFTER_BACKSPACE_JITTER_MS = 80;
+
+const REVISION_ARROW_MS = 35;
+const REVISION_SELECT_ARROW_MS = 22;
+const REVISION_BACKSPACE_MS = 85;
+const REVISION_BEFORE_DELETE_MS = 650;
+const REVISION_AFTER_SELECT_MS = 250;
+const REVISION_AFTER_DELETE_MS = 450;
+const REVISION_SELECT_DELETE_THRESHOLD = 30;
 
 function charDelay() {
   const r = (Math.random() + Math.random() - 1);
@@ -91,7 +110,7 @@ class Executor {
   async backspace(n, perKeyMs) {
     for (let i = 0; i < n; i++) {
       checkAbort();
-      dispatchKey(this.doc, { key: "Backspace", keyCode: KEY.Backspace });
+      dispatchKey(this.doc, { key: "Backspace", code: "Backspace", keyCode: KEY.Backspace });
       this.recordBackspace();
       await abortableSleep(perKeyMs ?? charDelay());
     }
@@ -108,11 +127,26 @@ class Executor {
     }
   }
 
+  async selectLeft(n, perKeyMs = REVISION_SELECT_ARROW_MS) {
+    for (let i = 0; i < n; i++) {
+      checkAbort();
+      dispatchKey(this.doc, { key: "ArrowLeft", keyCode: KEY.ArrowLeft, shiftKey: true });
+      await abortableSleep(perKeyMs);
+    }
+  }
+
+  async deleteSelection(start, end) {
+    checkAbort();
+    dispatchKey(this.doc, { key: "Backspace", code: "Backspace", keyCode: KEY.Backspace });
+    this.buffer = this.buffer.slice(0, start) + this.buffer.slice(end);
+    this.cursor = start;
+  }
+
   async typo(wrong, correct) {
     await this.typeText(wrong);
-    await abortableSleep(150 + Math.random() * 250);
-    await this.backspace(wrong.length);
-    await abortableSleep(80 + Math.random() * 120);
+    await abortableSleep(TYPO_BEFORE_BACKSPACE_MIN_MS + Math.random() * TYPO_BEFORE_BACKSPACE_JITTER_MS);
+    await this.backspace(wrong.length, TYPO_BACKSPACE_MS);
+    await abortableSleep(TYPO_AFTER_BACKSPACE_MIN_MS + Math.random() * TYPO_AFTER_BACKSPACE_JITTER_MS);
     await this.typeText(correct);
   }
 
@@ -125,19 +159,25 @@ class Executor {
     const targetEnd = idx + target.length;
 
     if (this.cursor > targetEnd) {
-      await this.arrow(-1, this.cursor - targetEnd);
+      await this.arrow(-1, this.cursor - targetEnd, REVISION_ARROW_MS);
     } else if (this.cursor < targetEnd) {
-      await this.arrow(1, targetEnd - this.cursor);
+      await this.arrow(1, targetEnd - this.cursor, REVISION_ARROW_MS);
     }
-    await abortableSleep(400);
+    await abortableSleep(REVISION_BEFORE_DELETE_MS);
 
-    await this.backspace(target.length, 30);
-    await abortableSleep(300);
+    if (target.length >= REVISION_SELECT_DELETE_THRESHOLD) {
+      await this.selectLeft(target.length);
+      await abortableSleep(REVISION_AFTER_SELECT_MS);
+      await this.deleteSelection(idx, targetEnd);
+    } else {
+      await this.backspace(target.length, REVISION_BACKSPACE_MS);
+    }
+    await abortableSleep(REVISION_AFTER_DELETE_MS);
 
     await this.typeText(replacement);
 
     const tail = this.buffer.length - this.cursor;
-    if (tail > 0) await this.arrow(1, tail);
+    if (tail > 0) await this.arrow(1, tail, REVISION_ARROW_MS);
   }
 }
 

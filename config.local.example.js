@@ -1,3 +1,3 @@
-// Copy this file to config.local.js and paste your OpenAI key.
-// config.local.js is gitignored.
-export const OPENAI_API_KEY = "PASTE_YOUR_OPENAI_KEY_HERE";
+// Legacy note: Typi no longer imports config.local.js at service-worker startup.
+// Set your OpenAI API key in the extension popup instead; it is stored in chrome.storage.local.
+// Keep any local config.local.js file uncommitted if you create one for experiments.

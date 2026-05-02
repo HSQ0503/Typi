@@ -278,6 +278,131 @@ function maybeDeepThinkingPauseMs(rhythm, justTyped) {
   return Math.max(1200, Math.min(6000, ms));
 }
 
+let activeOverlay = null;
+let activeOverlayProgress = null;
+let running = false;
+let currentJobId = null;
+
+function sendExecutionStatus(patch) {
+  try {
+    chrome.runtime.sendMessage({ type: "EXECUTION_STATUS", jobId: currentJobId, ...patch }).catch(() => {});
+  } catch (_e) {
+    // Popup/background status is helpful, but typing should not depend on it.
+  }
+}
+
+function blockPageInteraction(e) {
+  if (!activeOverlay) return;
+  if (e.target?.closest?.("[data-typi-stop]")) return;
+  e.preventDefault();
+  e.stopPropagation();
+  if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
+}
+
+const BLOCKED_EVENTS = [
+  "pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick",
+  "contextmenu", "keydown", "keypress", "keyup", "beforeinput", "input", "wheel"
+];
+
+function showTypingOverlay() {
+  if (activeOverlay) return;
+
+  const overlay = document.createElement("div");
+  overlay.setAttribute("data-typi-overlay", "true");
+  overlay.style.cssText = [
+    "position: fixed",
+    "inset: 0",
+    "z-index: 2147483647",
+    "display: flex",
+    "align-items: flex-start",
+    "justify-content: center",
+    "padding-top: 24px",
+    "background: rgba(15, 23, 42, 0.10)",
+    "pointer-events: auto",
+    "font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
+  ].join(";");
+
+  const card = document.createElement("div");
+  card.style.cssText = [
+    "width: min(520px, calc(100vw - 32px))",
+    "border: 1px solid rgba(13, 148, 136, 0.28)",
+    "border-radius: 18px",
+    "background: rgba(255, 255, 255, 0.96)",
+    "box-shadow: 0 18px 48px rgba(15, 23, 42, 0.22)",
+    "padding: 16px",
+    "color: #0f2f2c"
+  ].join(";");
+
+  const title = document.createElement("div");
+  title.textContent = "Typi is writing";
+  title.style.cssText = "font-size:16px;font-weight:900;margin-bottom:6px;";
+
+  const body = document.createElement("div");
+  body.textContent = "Don’t click or type in this Google Doc until Typi finishes. Clicks are blocked to protect the cursor.";
+  body.style.cssText = "font-size:13px;line-height:1.45;color:#4b635f;margin-bottom:12px;";
+
+  activeOverlayProgress = document.createElement("div");
+  activeOverlayProgress.textContent = "Preparing...";
+  activeOverlayProgress.style.cssText = "font-size:12px;font-weight:800;color:#0f766e;margin-bottom:12px;";
+
+  const stop = document.createElement("button");
+  stop.type = "button";
+  stop.textContent = "Stop Typi";
+  stop.setAttribute("data-typi-stop", "true");
+  stop.style.cssText = [
+    "min-height: 40px",
+    "padding: 0 14px",
+    "border: 1px solid #fecaca",
+    "border-radius: 12px",
+    "background: #fff",
+    "color: #dc2626",
+    "font: inherit",
+    "font-size: 13px",
+    "font-weight: 900",
+    "cursor: pointer"
+  ].join(";");
+  stop.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    aborted = true;
+    if (activeOverlayProgress) activeOverlayProgress.textContent = "Stopping...";
+    sendExecutionStatus({ phase: "stopping", status: "Stopping Typi..." });
+  });
+
+  card.appendChild(title);
+  card.appendChild(body);
+  card.appendChild(activeOverlayProgress);
+  card.appendChild(stop);
+  overlay.appendChild(card);
+  document.documentElement.appendChild(overlay);
+  activeOverlay = overlay;
+
+  for (const eventName of BLOCKED_EVENTS) {
+    document.addEventListener(eventName, blockPageInteraction, true);
+    window.addEventListener(eventName, blockPageInteraction, true);
+  }
+}
+
+function updateTypingOverlay(actionIndex, actionCount) {
+  if (!activeOverlayProgress) return;
+  if (!actionCount) {
+    activeOverlayProgress.textContent = "Writing...";
+    return;
+  }
+  const pct = Math.max(0, Math.min(100, Math.round((actionIndex / actionCount) * 100)));
+  activeOverlayProgress.textContent = `Writing... ${pct}% (${actionIndex}/${actionCount} actions)`;
+}
+
+function hideTypingOverlay() {
+  for (const eventName of BLOCKED_EVENTS) {
+    document.removeEventListener(eventName, blockPageInteraction, true);
+    window.removeEventListener(eventName, blockPageInteraction, true);
+  }
+  activeOverlay?.remove();
+  activeOverlay = null;
+  activeOverlayProgress = null;
+}
+
 class Executor {
   constructor(doc) {
     this.doc = doc;
@@ -431,10 +556,20 @@ async function abortableSleep(ms) {
 }
 
 async function executePlan(plan) {
-  aborted = false;
   const doc = getDocsTarget();
   const exec = new Executor(doc);
-  for (const action of plan.actions || []) {
+  const actions = plan.actions || [];
+  updateTypingOverlay(0, actions.length);
+  sendExecutionStatus({
+    phase: "typing",
+    status: "Typi is writing. Do not click in the document.",
+    progress: 0,
+    actionIndex: 0,
+    actionCount: actions.length
+  });
+
+  for (let i = 0; i < actions.length; i++) {
+    const action = actions[i];
     checkAbort();
     if (action.type === "write") {
       await exec.typeText(action.text);
@@ -445,33 +580,72 @@ async function executePlan(plan) {
     } else if (action.type === "revise") {
       await exec.revise(action.target, action.text);
     }
+
+    const actionIndex = i + 1;
+    const progress = actions.length ? actionIndex / actions.length : 1;
+    updateTypingOverlay(actionIndex, actions.length);
+    sendExecutionStatus({
+      phase: "typing",
+      status: "Typi is writing. Do not click in the document.",
+      progress,
+      actionIndex,
+      actionCount: actions.length
+    });
   }
 }
 
 const ERROR_KEY = "typi:lastError";
 
+async function runExecution(plan) {
+  running = true;
+  aborted = false;
+  chrome.storage.local.remove(ERROR_KEY);
+  showTypingOverlay();
+
+  try {
+    await executePlan(plan);
+    sendExecutionStatus({
+      phase: "done",
+      status: "Done. Typi finished writing.",
+      progress: 1,
+      actionIndex: plan.actions?.length || 0,
+      actionCount: plan.actions?.length || 0
+    });
+  } catch (e) {
+    const isAbort = e.name === "AbortedError";
+    if (!isAbort) {
+      console.error("[Typi] Executor error:", e);
+      chrome.storage.local.set({
+        [ERROR_KEY]: { message: e.message, stack: e.stack || "", ts: Date.now() }
+      });
+      sendExecutionStatus({ phase: "error", status: "Typi hit an error.", error: e.message });
+    } else {
+      sendExecutionStatus({ phase: "stopped", status: "Stopped by user.", error: "" });
+    }
+  } finally {
+    running = false;
+    currentJobId = null;
+    hideTypingOverlay();
+  }
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "STOP") {
     aborted = true;
+    if (activeOverlayProgress) activeOverlayProgress.textContent = "Stopping...";
+    sendExecutionStatus({ phase: "stopping", status: "Stopping Typi..." });
     sendResponse({ ok: true });
     return;
   }
   if (msg?.type !== "EXECUTE_PLAN") return;
 
-  chrome.storage.local.remove(ERROR_KEY);
-  if (msg.wpm) setTypingSpeed(msg.wpm);
+  if (running) {
+    sendResponse({ ok: false, error: "Typi is already writing in this tab." });
+    return;
+  }
 
-  executePlan(msg.plan)
-    .then(() => sendResponse({ ok: true }))
-    .catch((e) => {
-      const isAbort = e.name === "AbortedError";
-      if (!isAbort) {
-        console.error("[Typi] Executor error:", e);
-        chrome.storage.local.set({
-          [ERROR_KEY]: { message: e.message, stack: e.stack || "", ts: Date.now() }
-        });
-      }
-      sendResponse({ ok: isAbort, error: e.message, aborted: isAbort });
-    });
-  return true;
+  currentJobId = msg.jobId || `content-${Date.now()}`;
+  if (msg.wpm) setTypingSpeed(msg.wpm);
+  sendResponse({ ok: true, started: true });
+  runExecution(msg.plan);
 });

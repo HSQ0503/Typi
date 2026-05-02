@@ -1,14 +1,20 @@
 const MODEL = "gpt-4.1";
 const API_KEY_STORAGE_KEY = "typi:openaiApiKey";
 const PLANNING_DEBUG_KEY = "typi:lastPlanningDebug";
+const PLAN_KEY = "typi:lastPlan";
+const JOB_KEY = "typi:activeJob";
+const ERROR_KEY = "typi:lastError";
 const MAX_PLAN_ATTEMPTS = 3;
 const OPENAI_TIMEOUT_MS = 45_000;
 const CHUNKING_WORD_THRESHOLD = 500;
 const TARGET_PLANNING_CHUNK_WORDS = 425;
 const MIN_PLANNING_CHUNK_WORDS = 350;
 const PROTECTED_BLANK_LINES_RE = /\n{2,}[ \t]*/g;
-const MIN_TYPO_RATE = 0.03;
-const MAX_TYPO_RATE = 0.06;
+const MIN_TYPO_RATE = 0.015;
+const MAX_TYPO_RATE = 0.035;
+const TYPO_MIN_WORDS_FOR_ANY = 15;
+const TYPO_MIN_WORDS_FOR_REQUIRED = 120;
+const TYPO_MIN_WORD_LENGTH = 4;
 const REVISION_WORD_THRESHOLD = 250;
 
 const PLAN_SCHEMA = {
@@ -64,14 +70,17 @@ After a typo runs, the document contains exactly the "text" field — NOT "wrong
 
 Hard constraints on every typo action:
   - SCOPE IS EXACTLY ONE WORD. Both "wrong" and "text" must contain NO spaces and NO punctuation. Only the word itself.
+  - Use alphabetic words only: no numbers, symbols, dollar amounts, or punctuation.
+  - Prefer lowercase non-proper words of 4+ letters.
+  - Never typo proper nouns, professor/student names, company names, acronyms, dataset names, product/score names, numbers, money amounts, or technical labels.
   - "wrong" and "text" differ by 1-3 characters — a believable single-word typo.
-  - The corrected word appears ONCE in the final document. Adjacent "write" actions must NOT also contain that word, or the word will be duplicated.
+  - The corrected word appears in the final document. Adjacent "write" actions must NOT also contain that word, or the word will be duplicated.
 
 Examples — CORRECT usage:
-  {"type":"typo","wrong":"teh","text":"the","ms":0,"target":"","reason":"transposition"}
   {"type":"typo","wrong":"recieve","text":"receive","ms":0,"target":"","reason":"common misspelling"}
   {"type":"typo","wrong":"seperate","text":"separate","ms":0,"target":"","reason":"common misspelling"}
   {"type":"typo","wrong":"buisness","text":"business","ms":0,"target":"","reason":"missing letter"}
+  {"type":"typo","wrong":"qualtiy","text":"quality","ms":0,"target":"","reason":"transposition"}
 
 Examples — WRONG, do not do these:
   ❌ wrong="businesses", text="busniesses" — fields swapped (correct word in wrong, misspelling in text)
@@ -90,13 +99,13 @@ How to compose with neighbors:
     write: " receive the package."          ← duplicates the word
 
 Realistic typo styles to use:
-  - missing letter: "th"→"the", "buisness"→"business"
-  - extra letter: "thee"→"the", "succcess"→"success"
-  - transposition: "teh"→"the", "recieve"→"receive"
-  - adjacent-key slip: "yhe"→"the"
+  - missing letter: "buisness"→"business", "acess"→"access"
+  - extra letter: "succcess"→"success", "committment"→"commitment"
+  - transposition: "recieve"→"receive", "qualtiy"→"quality"
+  - adjacent-key slip on safe lowercase words only
   - common misspellings: "seperate"→"separate", "definately"→"definitely", "alot"→"a lot" (this last one violates scope, so skip word-splitters)
 
-Frequency: follow the per-input typo-count requirement exactly when provided. Don't typo every word — sprinkle them naturally across the document.
+Frequency: follow the per-input typo-count requirement exactly when provided. Don't typo every sentence. A professional email should look careful, with a few ordinary slips on safe lowercase words, not clumsy or chaotic.
 
 ==========================================
 REVISIONS — how to plan them
@@ -314,9 +323,11 @@ function countWords(text) {
 
 function typoCountRange(text) {
   const words = countWords(text);
+  if (words < TYPO_MIN_WORDS_FOR_ANY) return { words, min: 0, max: 0 };
+
   return {
     words,
-    min: Math.max(1, Math.ceil(words * MIN_TYPO_RATE)),
+    min: words < TYPO_MIN_WORDS_FOR_REQUIRED ? 0 : Math.ceil(words * MIN_TYPO_RATE),
     max: Math.max(1, Math.ceil(words * MAX_TYPO_RATE))
   };
 }
@@ -324,7 +335,8 @@ function typoCountRange(text) {
 function typoGuidance(text) {
   const { words, min, max } = typoCountRange(text);
   return `This input has approximately ${words} words. Include between ${min} and ${max} typo actions. ` +
-    `Distribute them naturally across the text. A typo action replaces exactly one final word, so preserve all surrounding spaces, articles, punctuation, and newlines in adjacent write actions.`;
+    `Distribute them naturally across the text. A typo action replaces exactly one final word, so preserve all surrounding spaces, articles, punctuation, and newlines in adjacent write actions. ` +
+    `Choose only safe lowercase alphabetic words of at least ${TYPO_MIN_WORD_LENGTH} letters. Avoid typos on names, capitalized words, acronyms, numbers, dollar amounts, company/product/dataset names, and technical terms.`;
 }
 
 function isPromptLikeChunk(text) {
@@ -363,8 +375,105 @@ function basePlanningGuidance(text) {
   return `${typoGuidance(text)}\nInclude 0 revise actions in this main plan. Revisions are inserted by a separate verified pass after the exact typo/pause plan is valid.`;
 }
 
+function editDistanceWithin(a, b, limit) {
+  if (Math.abs(a.length - b.length) > limit) return limit + 1;
+
+  let prev = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const curr = [i];
+    let rowMin = curr[0];
+
+    for (let j = 1; j <= b.length; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(
+        prev[j] + 1,
+        curr[j - 1] + 1,
+        prev[j - 1] + cost
+      );
+      rowMin = Math.min(rowMin, curr[j]);
+    }
+
+    if (rowMin > limit) return limit + 1;
+    prev = curr;
+  }
+
+  return prev[b.length];
+}
+
+function escapeRegExp(text) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function finalTextContainsWord(text, word) {
+  return new RegExp(`(^|[^A-Za-z])${escapeRegExp(word)}($|[^A-Za-z])`).test(text);
+}
+
+function unsafeTypoTargetReason(word) {
+  if (!word) return "empty corrected word";
+  if (!/^[A-Za-z]+$/.test(word)) return "corrected word contains punctuation, symbols, or numbers";
+  if (word.length < TYPO_MIN_WORD_LENGTH) return `corrected word is shorter than ${TYPO_MIN_WORD_LENGTH} letters`;
+  if (/[A-Z]/.test(word)) return "corrected word is capitalized/proper-noun-like";
+  return "";
+}
+
+function diagnoseTypoActions(actions, text) {
+  const problems = [];
+
+  actions.forEach((action, index) => {
+    if (action.type !== "typo") return;
+
+    const wrong = action.wrong || "";
+    const correct = action.text || "";
+
+    if (!/^[A-Za-z]+$/.test(wrong)) {
+      problems.push(`Action ${index}: typo wrong=${JSON.stringify(wrong)} must be one alphabetic word only, with no spaces, punctuation, symbols, or numbers.`);
+    }
+
+    const unsafeReason = unsafeTypoTargetReason(correct);
+    if (unsafeReason) {
+      problems.push(`Action ${index}: typo text=${JSON.stringify(correct)} is unsafe: ${unsafeReason}. Choose a lowercase ordinary word instead.`);
+    }
+
+    if (wrong && correct) {
+      const distance = editDistanceWithin(wrong.toLowerCase(), correct.toLowerCase(), 3);
+      if (distance === 0 || distance > 3) {
+        problems.push(`Action ${index}: typo wrong=${JSON.stringify(wrong)} and text=${JSON.stringify(correct)} must differ by 1-3 characters.`);
+      }
+    }
+
+    if (correct && !finalTextContainsWord(text, correct)) {
+      problems.push(`Action ${index}: corrected typo word ${JSON.stringify(correct)} does not appear as a standalone word in this exact chunk.`);
+    }
+  });
+
+  return problems;
+}
+
 function diagnosePlanRequirements(plan, text) {
   const actions = plan.actions || [];
+  const typoCount = actions.filter((action) => action.type === "typo").length;
+  const typoRange = typoCountRange(text);
+  const typoProblems = diagnoseTypoActions(actions, text);
+
+  if (typoProblems.length > 0) {
+    return {
+      ok: false,
+      message:
+        `Invalid typo action(s):\n- ${typoProblems.slice(0, 8).join("\n- ")}\n` +
+        `Typo actions must be sparse, lowercase, alphabetic, single-word slips on safe non-proper words. Avoid names, acronyms, technical labels, numbers, and punctuation.`
+    };
+  }
+
+  if (typoCount < typoRange.min || typoCount > typoRange.max) {
+    return {
+      ok: false,
+      message:
+        `Typo count ${typoCount} is outside the required range ` +
+        `${typoRange.min}-${typoRange.max} for this ${typoRange.words}-word chunk. ` +
+        `Use fewer, safer typo actions. Do not typo every sentence or any proper nouns/acronyms/numbers.`
+    };
+  }
+
   const reviseCount = actions.filter((action) => action.type === "revise").length;
   const reviseRange = revisionCountRange(text);
 
@@ -466,6 +575,82 @@ function splitIntoPlanningUnits(text) {
 
 function makeLiteralPlan(text) {
   return { actions: [{ type: "write", text, wrong: "", target: "", ms: 0, reason: "protected whitespace/section break" }] };
+}
+
+function makePauseAction(ms, reason) {
+  return { type: "pause", text: "", wrong: "", target: "", ms, reason };
+}
+
+function lastActionIsPause(actions) {
+  return actions[actions.length - 1]?.type === "pause";
+}
+
+function pushPauseIfNeeded(actions, ms, reason) {
+  if (lastActionIsPause(actions)) return false;
+  actions.push(makePauseAction(ms, reason));
+  return true;
+}
+
+function pushWrite(actions, baseAction, text) {
+  if (!text) return;
+  actions.push({ ...baseAction, text });
+}
+
+function appendWriteWithComposingPauses(output, action, state) {
+  let text = action.text || "";
+  let pos = 0;
+
+  if (!state.greetingPauseInserted && state.buffer.length === 0) {
+    const greeting = text.match(/^Dear [^\n]+,\n/);
+    if (greeting) {
+      pushWrite(output, action, greeting[0]);
+      state.buffer += greeting[0];
+      if (pushPauseIfNeeded(output, 900, "settling into the email after greeting")) state.pauseCount++;
+      state.greetingPauseInserted = true;
+      pos = greeting[0].length;
+    }
+  }
+
+  const paragraphBreakRe = /\n{2,}[ \t]*/g;
+  paragraphBreakRe.lastIndex = pos;
+  for (const match of text.matchAll(paragraphBreakRe)) {
+    const end = match.index + match[0].length;
+    pushWrite(output, action, text.slice(pos, end));
+    state.buffer += text.slice(pos, end);
+    if (pushPauseIfNeeded(output, 1800, "paragraph break / next thought")) state.pauseCount++;
+    pos = end;
+  }
+
+  const rest = text.slice(pos);
+  if (rest) {
+    if (/^\s*On\b/.test(rest) && state.buffer.length > 0) {
+      if (pushPauseIfNeeded(output, 1200, "transitioning to next feedback point")) state.pauseCount++;
+    }
+    pushWrite(output, action, rest);
+    state.buffer += rest;
+  }
+}
+
+function enhancePlanPauses(plan) {
+  const output = [];
+  const state = { buffer: "", greetingPauseInserted: false, pauseCount: 0 };
+
+  for (const action of plan.actions || []) {
+    if (action.type === "write") {
+      appendWriteWithComposingPauses(output, action, state);
+    } else {
+      if (action.type === "typo") state.buffer += action.text || "";
+      else if (action.type === "revise") {
+        const idx = state.buffer.lastIndexOf(action.target);
+        if (idx !== -1) {
+          state.buffer = state.buffer.slice(0, idx) + action.text + state.buffer.slice(idx + action.target.length);
+        }
+      }
+      output.push(action);
+    }
+  }
+
+  return { plan: { actions: output }, insertedPauseCount: state.pauseCount };
 }
 
 function chunkBoundarySummary(chunk) {
@@ -800,10 +985,21 @@ async function generatePlan(text) {
       }
     }
 
+    const pauseEnhancement = enhancePlanPauses(combinedPlan);
+    combinedPlan = pauseEnhancement.plan;
+    const postPauseDiag = diagnosePlan(combinedPlan, text);
+    if (!postPauseDiag.ok) {
+      throw new Error(`Plan mismatch after pause enhancement: ${postPauseDiag.message}`);
+    }
+
+    debug.typoRange = typoCountRange(text);
+    debug.typoCount = combinedPlan.actions.filter((a) => a.type === "typo").length;
     debug.revisionCountAfterGlobalPass = combinedPlan.actions.filter((a) => a.type === "revise").length;
+    debug.insertedComposingPauseCount = pauseEnhancement.insertedPauseCount;
+    debug.actionCountAfterPauseEnhancement = combinedPlan.actions.length;
     debug.ok = true;
     await savePlanningDebug(debug);
-    console.log(`[Typi] Full plan verified across ${llmUnits.length} LLM chunk(s), ${units.length} total unit(s), ${combinedPlan.actions.length} actions, ${debug.revisionCountAfterGlobalPass} revision(s).`);
+    console.log(`[Typi] Full plan verified across ${llmUnits.length} LLM chunk(s), ${units.length} total unit(s), ${combinedPlan.actions.length} actions, ${debug.typoCount} typo(s), ${debug.revisionCountAfterGlobalPass} revision(s).`);
     return combinedPlan;
   } catch (e) {
     debug.finalError = e.message;
@@ -813,10 +1009,153 @@ async function generatePlan(text) {
   }
 }
 
+let activeJobPromise = null;
+const cancelledJobIds = new Set();
+
+function newJobId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  return `job-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
+
+async function getActiveJob() {
+  const res = await chrome.storage.local.get(JOB_KEY);
+  return res[JOB_KEY] || null;
+}
+
+async function updateJob(patch) {
+  const current = await getActiveJob();
+  const next = { ...(current || {}), ...patch, updatedAt: Date.now() };
+  await chrome.storage.local.set({ [JOB_KEY]: next });
+  return next;
+}
+
+function isLiveJob(job) {
+  const isActivePhase = job && ["planning", "typing", "stopping"].includes(job.phase);
+  const isFresh = !job?.updatedAt || Date.now() - job.updatedAt < 6 * 60 * 60 * 1000;
+  return isActivePhase && isFresh;
+}
+
+async function runBackgroundJob({ jobId, text, tabId, wpm }) {
+  try {
+    cancelledJobIds.delete(jobId);
+    await chrome.storage.local.remove(ERROR_KEY);
+    await updateJob({
+      id: jobId,
+      tabId,
+      wpm,
+      phase: "planning",
+      status: "Planning in the background. Keep the Google Doc tab open.",
+      progress: 0,
+      actionIndex: 0,
+      actionCount: 0,
+      error: "",
+      startedAt: Date.now()
+    });
+
+    const plan = await generatePlan(text);
+    await chrome.storage.local.set({ [PLAN_KEY]: { text, plan } });
+
+    if (cancelledJobIds.has(jobId)) {
+      await updateJob({ phase: "stopped", status: "Stopped before typing started.", progress: 0 });
+      return;
+    }
+
+    await updateJob({
+      phase: "typing",
+      status: "Plan ready. Typi is writing in the original Google Doc tab.",
+      actionCount: plan.actions?.length || 0,
+      progress: 0
+    });
+
+    const execRes = await chrome.tabs.sendMessage(tabId, { type: "EXECUTE_PLAN", plan, wpm, jobId });
+    if (!execRes?.ok) throw new Error(execRes?.error || "Could not start typing in Google Docs.");
+  } catch (e) {
+    if (!cancelledJobIds.has(jobId)) {
+      await chrome.storage.local.set({ [ERROR_KEY]: { message: e.message, stack: e.stack || "", ts: Date.now() } });
+      await updateJob({ phase: "error", status: "Typi hit an error.", error: e.message });
+    }
+  } finally {
+    cancelledJobIds.delete(jobId);
+    activeJobPromise = null;
+  }
+}
+
+async function stopActiveJob(sendResponse) {
+  const job = await getActiveJob();
+  if (!job?.id) {
+    sendResponse({ ok: true, stopped: false });
+    return;
+  }
+
+  cancelledJobIds.add(job.id);
+  await updateJob({ phase: "stopping", status: "Stopping Typi..." });
+
+  let stopMessageDelivered = false;
+  if (job.tabId) {
+    try {
+      await chrome.tabs.sendMessage(job.tabId, { type: "STOP", jobId: job.id });
+      stopMessageDelivered = true;
+    } catch (_e) {
+      // The job may still be planning, or the tab may have been closed.
+    }
+  }
+
+  if (job.phase === "planning") {
+    await updateJob({ phase: "stopped", status: "Stopped. Typing will not start." });
+  } else if (!stopMessageDelivered) {
+    await updateJob({ phase: "stopped", status: "Stopped locally. Could not reach the Google Doc tab." });
+  }
+
+  sendResponse({ ok: true, stopped: true });
+}
+
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
-  if (msg?.type !== "PLAN") return;
-  generatePlan(msg.text)
-    .then((plan) => sendResponse({ ok: true, plan }))
-    .catch((e) => sendResponse({ ok: false, error: e.message, debug: e.debug || null }));
-  return true;
+  if (msg?.type === "PLAN") {
+    generatePlan(msg.text)
+      .then((plan) => sendResponse({ ok: true, plan }))
+      .catch((e) => sendResponse({ ok: false, error: e.message, debug: e.debug || null }));
+    return true;
+  }
+
+  if (msg?.type === "START_JOB") {
+    (async () => {
+      const existing = await getActiveJob();
+      if (activeJobPromise || isLiveJob(existing)) {
+        sendResponse({ ok: false, error: "Typi is already planning or writing. Stop it before starting another run." });
+        return;
+      }
+
+      const jobId = newJobId();
+      activeJobPromise = runBackgroundJob({ jobId, text: msg.text || "", tabId: msg.tabId, wpm: msg.wpm });
+      sendResponse({ ok: true, jobId });
+    })().catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (msg?.type === "STOP_JOB") {
+    stopActiveJob(sendResponse).catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
+
+  if (msg?.type === "EXECUTION_STATUS") {
+    (async () => {
+      const job = await getActiveJob();
+      if (!job || (msg.jobId && job.id && msg.jobId !== job.id)) {
+        sendResponse({ ok: true, ignored: true });
+        return;
+      }
+
+      const patch = {
+        phase: msg.phase || job.phase,
+        status: msg.status || job.status,
+        progress: typeof msg.progress === "number" ? msg.progress : job.progress,
+        actionIndex: typeof msg.actionIndex === "number" ? msg.actionIndex : job.actionIndex,
+        actionCount: typeof msg.actionCount === "number" ? msg.actionCount : job.actionCount,
+        error: msg.error || ""
+      };
+      await updateJob(patch);
+      sendResponse({ ok: true });
+    })().catch((e) => sendResponse({ ok: false, error: e.message }));
+    return true;
+  }
 });

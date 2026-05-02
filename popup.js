@@ -14,6 +14,7 @@ const API_KEY_STORAGE_KEY = "typi:openaiApiKey";
 const PLANNING_DEBUG_KEY = "typi:lastPlanningDebug";
 const ERROR_KEY = "typi:lastError";
 const WPM_KEY = "typi:wpm";
+const JOB_KEY = "typi:activeJob";
 const DEFAULT_WPM = 150;
 const ERROR_TTL_MS = 5 * 60 * 1000;
 
@@ -134,6 +135,38 @@ function showStatus(message) {
   statusEl.style.color = "";
 }
 
+function isLiveJob(job) {
+  const isActivePhase = job && ["planning", "typing", "stopping"].includes(job.phase);
+  const isFresh = !job?.updatedAt || Date.now() - job.updatedAt < 6 * 60 * 60 * 1000;
+  return isActivePhase && isFresh;
+}
+
+function applyJobStatus(job) {
+  const live = isLiveJob(job);
+  runEl.disabled = !!live;
+  stopEl.disabled = !live;
+  runEl.textContent = live ? "Typi running..." : "Plan & type";
+
+  if (!job?.phase) return;
+
+  if (job.phase === "planning") {
+    showStatus(job.status || "Planning in the background. You can close this popup.");
+  } else if (job.phase === "typing") {
+    const pct = Math.max(0, Math.min(100, Math.round((job.progress || 0) * 100)));
+    showStatus(`${job.status || "Typing in Google Docs."} ${pct}%`);
+  } else if (job.phase === "stopping") {
+    showStatus(job.status || "Stopping Typi...");
+  } else if (job.phase === "done") {
+    showStatus(job.status || "Done. Typi finished writing.");
+  } else if (job.phase === "stopped") {
+    showStatus(job.status || "Stopped.");
+  } else if (job.phase === "error") {
+    showError(`Error: ${job.error || job.status || "Typi hit an error."}`);
+  }
+
+  if (job.plan) renderPlan(job.plan);
+}
+
 async function saveApiKey({ quiet = false } = {}) {
   const key = apiKeyEl.value.trim();
   if (!key) {
@@ -156,7 +189,7 @@ function updateWpmReadout(wpm) {
   if (wpmReadoutEl) wpmReadoutEl.textContent = `${wpm} WPM`;
 }
 
-chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERROR_KEY, WPM_KEY]).then((res) => {
+chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERROR_KEY, WPM_KEY, JOB_KEY]).then((res) => {
   const cached = res[PLAN_KEY];
   if (cached?.plan) renderPlan(cached.plan);
   if (cached?.text) textEl.value = cached.text;
@@ -173,6 +206,20 @@ chrome.storage.local.get([PLAN_KEY, API_KEY_STORAGE_KEY, PLANNING_DEBUG_KEY, ERR
   const lastErr = res[ERROR_KEY];
   if (lastErr && Date.now() - lastErr.ts < ERROR_TTL_MS) {
     showError(`Last run errored: ${lastErr.message}`);
+  }
+
+  applyJobStatus(res[JOB_KEY]);
+});
+
+chrome.storage.onChanged.addListener((changes, areaName) => {
+  if (areaName !== "local") return;
+  if (changes[JOB_KEY]) applyJobStatus(changes[JOB_KEY].newValue);
+  if (changes[PLAN_KEY]?.newValue?.plan) renderPlan(changes[PLAN_KEY].newValue.plan);
+  if (changes[ERROR_KEY]?.newValue) {
+    const lastErr = changes[ERROR_KEY].newValue;
+    if (lastErr && Date.now() - lastErr.ts < ERROR_TTL_MS) {
+      showError(`Last run errored: ${lastErr.message}`);
+    }
   }
 });
 
@@ -215,11 +262,10 @@ textEl.addEventListener("change", () => {
 });
 
 stopEl.addEventListener("click", async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) return;
   try {
-    await chrome.tabs.sendMessage(tab.id, { type: "STOP" });
-    showStatus("Stopped.");
+    const res = await chrome.runtime.sendMessage({ type: "STOP_JOB" });
+    if (!res?.ok) throw new Error(res?.error || "Stop failed");
+    showStatus("Stopping Typi...");
   } catch (e) {
     showError(`Stop failed: ${e.message}`);
   }
@@ -241,28 +287,20 @@ runEl.addEventListener("click", async () => {
   }
 
   runEl.disabled = true;
-  showStatus("Planning with gpt-4.1...");
+  stopEl.disabled = false;
+  showStatus("Starting Typi in the background...");
   planEl.innerHTML = "";
   planHeadingEl.style.display = "none";
   chrome.storage.local.remove(ERROR_KEY);
 
   try {
-    const planRes = await chrome.runtime.sendMessage({ type: "PLAN", text });
-    if (!planRes?.ok) {
-      if (planRes?.debug) renderDebug(planRes.debug);
-      throw new Error(planRes?.error || "Plan failed");
-    }
-
-    const plan = planRes.plan;
-    renderPlan(plan);
-    chrome.storage.local.set({ [PLAN_KEY]: { text, plan } });
-    showStatus(`Plan ready (${plan.actions.length} actions). Typing — you can close this.`);
-
     const wpm = clampWpm(wpmEl?.value ?? DEFAULT_WPM);
-    chrome.tabs.sendMessage(tab.id, { type: "EXECUTE_PLAN", plan, wpm }).catch(() => {});
+    const startRes = await chrome.runtime.sendMessage({ type: "START_JOB", text, tabId: tab.id, wpm });
+    if (!startRes?.ok) throw new Error(startRes?.error || "Could not start Typi");
+    showStatus("Planning in the background. You can close this popup, but keep the Google Doc tab open.");
   } catch (e) {
     showError(`Error: ${e.message}`);
-  } finally {
     runEl.disabled = false;
+    stopEl.disabled = true;
   }
 });

@@ -130,6 +130,60 @@
         line-height: 1.45;
       }
 
+      .setup-guide {
+        margin-top: 4px;
+        border: 1px solid rgba(13, 148, 136, 0.18);
+        border-radius: var(--radius-md);
+        background: var(--surface-soft);
+        color: var(--muted);
+        font-size: 11px;
+        line-height: 1.45;
+        overflow: hidden;
+      }
+
+      .setup-guide summary {
+        padding: 10px 11px;
+        color: var(--primary-dark);
+        font-weight: 900;
+        cursor: pointer;
+      }
+
+      .setup-guide[open] summary {
+        border-bottom: 1px solid rgba(13, 148, 136, 0.14);
+      }
+
+      .setup-guide-content {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px 11px 11px;
+      }
+
+      .setup-guide ol {
+        margin: 0;
+        padding-left: 18px;
+      }
+
+      .setup-guide li { margin: 0 0 6px; }
+      .setup-guide li:last-child { margin-bottom: 0; }
+
+      .setup-guide a {
+        color: var(--primary-dark);
+        font-weight: 800;
+        text-decoration: none;
+      }
+
+      .setup-guide a:hover { text-decoration: underline; }
+
+      .setup-guide code {
+        padding: 1px 4px;
+        border-radius: 5px;
+        background: #e2f7f3;
+        color: var(--text-strong);
+        font-family: var(--mono);
+        font-size: 10px;
+      }
+
       .field-group {
         display: flex;
         flex-direction: column;
@@ -369,6 +423,19 @@
           <label for="apiKey">Secret key</label>
           <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
           <p class="hint">Stored only for this Chrome profile. Set it once before planning.</p>
+          <details class="setup-guide">
+            <summary>How to get an OpenAI API key</summary>
+            <div class="setup-guide-content">
+              <ol>
+                <li>Open <a href="https://platform.openai.com/signup" target="_blank" rel="noreferrer">platform.openai.com/signup</a> and create or sign in to your OpenAI account.</li>
+                <li>Open billing at <a href="https://platform.openai.com/settings/organization/billing/overview" target="_blank" rel="noreferrer">platform.openai.com/settings/organization/billing/overview</a> and add a payment method if needed.</li>
+                <li>Go to <a href="https://platform.openai.com/api-keys" target="_blank" rel="noreferrer">platform.openai.com/api-keys</a>.</li>
+                <li>Click <strong>Create new secret key</strong>, name it <code>Typi</code>, then copy the key.</li>
+                <li>Paste it here and click <strong>Set API key for this user</strong>.</li>
+              </ol>
+              <p class="hint">Typi stores the key locally in this Chrome profile and uses it only to request typing plans.</p>
+            </div>
+          </details>
           <button id="saveKey" class="secondary" type="button">Set API key for this user</button>
         </div>
       </section>

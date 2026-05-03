@@ -27,9 +27,54 @@ function dispatchKey(doc, { key, code, keyCode, char, shiftKey }) {
   };
   target.dispatchEvent(new KeyboardEvent("keydown", common));
   if (char !== undefined) {
-    target.dispatchEvent(new KeyboardEvent("keypress", { ...common, charCode: char.charCodeAt(0) }));
+    const charCode = char.charCodeAt(0);
+    target.dispatchEvent(new KeyboardEvent("keypress", { ...common, keyCode: charCode, which: charCode, charCode }));
   }
   target.dispatchEvent(new KeyboardEvent("keyup", common));
+}
+
+const PRINTABLE_KEY_INFO = {
+  " ": { code: "Space", keyCode: 32 },
+  "-": { code: "Minus", keyCode: 189 },
+  "_": { code: "Minus", keyCode: 189, shiftKey: true },
+  "=": { code: "Equal", keyCode: 187 },
+  "+": { code: "Equal", keyCode: 187, shiftKey: true },
+  "[": { code: "BracketLeft", keyCode: 219 },
+  "{": { code: "BracketLeft", keyCode: 219, shiftKey: true },
+  "]": { code: "BracketRight", keyCode: 221 },
+  "}": { code: "BracketRight", keyCode: 221, shiftKey: true },
+  "\\": { code: "Backslash", keyCode: 220 },
+  "|": { code: "Backslash", keyCode: 220, shiftKey: true },
+  ";": { code: "Semicolon", keyCode: 186 },
+  ":": { code: "Semicolon", keyCode: 186, shiftKey: true },
+  "'": { code: "Quote", keyCode: 222 },
+  "\"": { code: "Quote", keyCode: 222, shiftKey: true },
+  ",": { code: "Comma", keyCode: 188 },
+  "<": { code: "Comma", keyCode: 188, shiftKey: true },
+  ".": { code: "Period", keyCode: 190 },
+  ">": { code: "Period", keyCode: 190, shiftKey: true },
+  "/": { code: "Slash", keyCode: 191 },
+  "?": { code: "Slash", keyCode: 191, shiftKey: true },
+  "`": { code: "Backquote", keyCode: 192 },
+  "~": { code: "Backquote", keyCode: 192, shiftKey: true },
+  "!": { code: "Digit1", keyCode: 49, shiftKey: true },
+  "@": { code: "Digit2", keyCode: 50, shiftKey: true },
+  "#": { code: "Digit3", keyCode: 51, shiftKey: true },
+  "$": { code: "Digit4", keyCode: 52, shiftKey: true },
+  "%": { code: "Digit5", keyCode: 53, shiftKey: true },
+  "^": { code: "Digit6", keyCode: 54, shiftKey: true },
+  "&": { code: "Digit7", keyCode: 55, shiftKey: true },
+  "*": { code: "Digit8", keyCode: 56, shiftKey: true },
+  "(": { code: "Digit9", keyCode: 57, shiftKey: true },
+  ")": { code: "Digit0", keyCode: 48, shiftKey: true }
+};
+
+function printableKeyInfo(ch) {
+  if (/[a-zA-Z]/.test(ch)) {
+    return { code: `Key${ch.toUpperCase()}`, keyCode: ch.toUpperCase().charCodeAt(0), shiftKey: /[A-Z]/.test(ch) };
+  }
+  if (/[0-9]/.test(ch)) return { code: `Digit${ch}`, keyCode: ch.charCodeAt(0), shiftKey: false };
+  return PRINTABLE_KEY_INFO[ch] || { code: "Unidentified", keyCode: 0, shiftKey: false };
 }
 
 function rawTypeChar(doc, ch) {
@@ -37,12 +82,8 @@ function rawTypeChar(doc, ch) {
     dispatchKey(doc, { key: "Enter", keyCode: KEY.Enter });
     return;
   }
-  const keyCode = ch.toUpperCase().charCodeAt(0);
-  const code =
-    /[a-zA-Z]/.test(ch) ? `Key${ch.toUpperCase()}` :
-    /[0-9]/.test(ch) ? `Digit${ch}` :
-    ch === " " ? "Space" : undefined;
-  dispatchKey(doc, { key: ch, code, keyCode, char: ch });
+  const info = printableKeyInfo(ch);
+  dispatchKey(doc, { key: ch, code: info.code, keyCode: info.keyCode, char: ch, shiftKey: info.shiftKey });
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -77,13 +118,15 @@ const TYPO_BACKSPACE_MS = 70;
 const TYPO_AFTER_BACKSPACE_MIN_MS = 100;
 const TYPO_AFTER_BACKSPACE_JITTER_MS = 80;
 
-const REVISION_ARROW_MS = 35;
-const REVISION_SELECT_ARROW_MS = 22;
-const REVISION_BACKSPACE_MS = 85;
+const REVISION_ARROW_MS = 65;
+const REVISION_SELECT_ARROW_MS = 35;
+const REVISION_BACKSPACE_MS = 90;
 const REVISION_BEFORE_DELETE_MS = 650;
 const REVISION_AFTER_SELECT_MS = 250;
 const REVISION_AFTER_DELETE_MS = 450;
-const REVISION_SELECT_DELETE_THRESHOLD = 30;
+// Short/medium revisions are safer as paced Backspace events. Shift-selecting
+// short sentences can over/under-select in Google Docs if any arrow event drops.
+const REVISION_SELECT_DELETE_THRESHOLD = 160;
 
 // Common bigrams a fluent typist races through, awkward pairs they slow on.
 // Values are multipliers applied to the per-key mean.
@@ -279,7 +322,10 @@ function maybeDeepThinkingPauseMs(rhythm, justTyped) {
 }
 
 let activeOverlay = null;
+let activeOverlayCard = null;
+let activeOverlayPill = null;
 let activeOverlayProgress = null;
+let activePillProgress = null;
 let running = false;
 let currentJobId = null;
 
@@ -293,7 +339,7 @@ function sendExecutionStatus(patch) {
 
 function blockPageInteraction(e) {
   if (!activeOverlay) return;
-  if (e.target?.closest?.("[data-typi-stop]")) return;
+  if (e.target?.closest?.("[data-typi-control]")) return;
   e.preventDefault();
   e.stopPropagation();
   if (typeof e.stopImmediatePropagation === "function") e.stopImmediatePropagation();
@@ -303,6 +349,44 @@ const BLOCKED_EVENTS = [
   "pointerdown", "pointerup", "mousedown", "mouseup", "click", "dblclick",
   "contextmenu", "keydown", "keypress", "keyup", "beforeinput", "input", "wheel"
 ];
+
+function makeOverlayButton(text, kind = "secondary") {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = text;
+  button.setAttribute("data-typi-control", "true");
+  const isDanger = kind === "danger";
+  button.style.cssText = [
+    "min-height: 40px",
+    "padding: 0 14px",
+    `border: 1px solid ${isDanger ? "#fecaca" : "#99f6e4"}`,
+    "border-radius: 12px",
+    `background: ${isDanger ? "#fff" : "#ccfbf1"}`,
+    `color: ${isDanger ? "#dc2626" : "#0f766e"}`,
+    "font: inherit",
+    "font-size: 13px",
+    "font-weight: 900",
+    "cursor: pointer"
+  ].join(";");
+  return button;
+}
+
+function stopTypingFromOverlay() {
+  aborted = true;
+  if (activeOverlayProgress) activeOverlayProgress.textContent = "Stopping...";
+  if (activePillProgress) activePillProgress.textContent = "Stopping...";
+  sendExecutionStatus({ phase: "stopping", status: "Stopping Typi..." });
+}
+
+function setOverlayCollapsed(collapsed) {
+  if (!activeOverlay || !activeOverlayCard || !activeOverlayPill) return;
+  activeOverlayCard.style.display = collapsed ? "none" : "block";
+  activeOverlayPill.style.display = collapsed ? "flex" : "none";
+  activeOverlay.style.background = collapsed ? "transparent" : "rgba(15, 23, 42, 0.10)";
+  activeOverlay.style.alignItems = collapsed ? "flex-end" : "flex-start";
+  activeOverlay.style.justifyContent = collapsed ? "flex-end" : "center";
+  activeOverlay.style.padding = collapsed ? "0 16px 16px 0" : "24px 0 0 0";
+}
 
 function showTypingOverlay() {
   if (activeOverlay) return;
@@ -316,7 +400,7 @@ function showTypingOverlay() {
     "display: flex",
     "align-items: flex-start",
     "justify-content: center",
-    "padding-top: 24px",
+    "padding: 24px 0 0 0",
     "background: rgba(15, 23, 42, 0.10)",
     "pointer-events: auto",
     "font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif"
@@ -345,37 +429,75 @@ function showTypingOverlay() {
   activeOverlayProgress.textContent = "Preparing...";
   activeOverlayProgress.style.cssText = "font-size:12px;font-weight:800;color:#0f766e;margin-bottom:12px;";
 
-  const stop = document.createElement("button");
-  stop.type = "button";
-  stop.textContent = "Stop Typi";
-  stop.setAttribute("data-typi-stop", "true");
-  stop.style.cssText = [
-    "min-height: 40px",
-    "padding: 0 14px",
-    "border: 1px solid #fecaca",
-    "border-radius: 12px",
-    "background: #fff",
-    "color: #dc2626",
-    "font: inherit",
-    "font-size: 13px",
-    "font-weight: 900",
-    "cursor: pointer"
-  ].join(";");
+  const actions = document.createElement("div");
+  actions.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+
+  const hide = makeOverlayButton("Hide panel");
+  hide.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOverlayCollapsed(true);
+  });
+
+  const stop = makeOverlayButton("Stop Typi", "danger");
   stop.addEventListener("click", (e) => {
     e.preventDefault();
     e.stopPropagation();
-    aborted = true;
-    if (activeOverlayProgress) activeOverlayProgress.textContent = "Stopping...";
-    sendExecutionStatus({ phase: "stopping", status: "Stopping Typi..." });
+    stopTypingFromOverlay();
   });
+
+  actions.appendChild(hide);
+  actions.appendChild(stop);
+
+  const pill = document.createElement("div");
+  pill.setAttribute("data-typi-control", "true");
+  pill.style.cssText = [
+    "display: none",
+    "align-items: center",
+    "gap: 10px",
+    "max-width: min(440px, calc(100vw - 32px))",
+    "border: 1px solid rgba(13, 148, 136, 0.28)",
+    "border-radius: 999px",
+    "background: rgba(255, 255, 255, 0.96)",
+    "box-shadow: 0 12px 34px rgba(15, 23, 42, 0.18)",
+    "padding: 8px 10px 8px 14px",
+    "color: #0f2f2c"
+  ].join(";");
+
+  activePillProgress = document.createElement("div");
+  activePillProgress.textContent = "Typi writing...";
+  activePillProgress.style.cssText = "font-size:12px;font-weight:900;color:#0f766e;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;";
+
+  const show = makeOverlayButton("Show");
+  show.style.minHeight = "32px";
+  show.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setOverlayCollapsed(false);
+  });
+
+  const pillStop = makeOverlayButton("Stop", "danger");
+  pillStop.style.minHeight = "32px";
+  pillStop.addEventListener("click", (e) => {
+    e.preventDefault();
+    e.stopPropagation();
+    stopTypingFromOverlay();
+  });
+
+  pill.appendChild(activePillProgress);
+  pill.appendChild(show);
+  pill.appendChild(pillStop);
 
   card.appendChild(title);
   card.appendChild(body);
   card.appendChild(activeOverlayProgress);
-  card.appendChild(stop);
+  card.appendChild(actions);
   overlay.appendChild(card);
+  overlay.appendChild(pill);
   document.documentElement.appendChild(overlay);
   activeOverlay = overlay;
+  activeOverlayCard = card;
+  activeOverlayPill = pill;
 
   for (const eventName of BLOCKED_EVENTS) {
     document.addEventListener(eventName, blockPageInteraction, true);
@@ -384,13 +506,11 @@ function showTypingOverlay() {
 }
 
 function updateTypingOverlay(actionIndex, actionCount) {
-  if (!activeOverlayProgress) return;
-  if (!actionCount) {
-    activeOverlayProgress.textContent = "Writing...";
-    return;
-  }
-  const pct = Math.max(0, Math.min(100, Math.round((actionIndex / actionCount) * 100)));
-  activeOverlayProgress.textContent = `Writing... ${pct}% (${actionIndex}/${actionCount} actions)`;
+  const label = actionCount
+    ? `Writing... ${Math.max(0, Math.min(100, Math.round((actionIndex / actionCount) * 100)))}% (${actionIndex}/${actionCount} actions)`
+    : "Writing...";
+  if (activeOverlayProgress) activeOverlayProgress.textContent = label;
+  if (activePillProgress) activePillProgress.textContent = label;
 }
 
 function hideTypingOverlay() {
@@ -400,7 +520,10 @@ function hideTypingOverlay() {
   }
   activeOverlay?.remove();
   activeOverlay = null;
+  activeOverlayCard = null;
+  activeOverlayPill = null;
   activeOverlayProgress = null;
+  activePillProgress = null;
 }
 
 class Executor {
@@ -633,6 +756,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg?.type === "STOP") {
     aborted = true;
     if (activeOverlayProgress) activeOverlayProgress.textContent = "Stopping...";
+    if (activePillProgress) activePillProgress.textContent = "Stopping...";
     sendExecutionStatus({ phase: "stopping", status: "Stopping Typi..." });
     sendResponse({ ok: true });
     return;
